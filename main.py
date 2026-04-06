@@ -43,15 +43,8 @@ def parse_input(filepath):
     for i in range(1, N + 1):
         tw_lo[i] = max(tw_lo[i], T[0][i])
         tw_hi[i] = min(tw_hi[i], tw_hi[0] - T[i][0])
-
-    all_int_times = all(
-        v == int(v) for row in T for v in row
-    ) and all(
-        tw_lo[i] == int(tw_lo[i]) and tw_hi[i] == int(tw_hi[i])
-        for i in range(N + 1)
-    )
-
-    return N, K, Q, Gamma, s, tw_lo, tw_hi, T, C, all_int_times
+        
+    return N, K, Q, Gamma, s, tw_lo, tw_hi, T, C
 
 
 def write_output(filepath, obj_val, routes):
@@ -74,7 +67,7 @@ def write_output(filepath, obj_val, routes):
         f.write('\n'.join(lines) + '\n')
 
 
-def solve(N, K, Q, Gamma, s, tw_lo, tw_hi, T, C, all_int_times, time_limit=300):
+def solve(N, K, Q, Gamma, s, tw_lo, tw_hi, T, C, time_limit=300):
     model = g.Model()
     model.Params.OutputFlag = 0
     model.Params.TimeLimit = max(1, time_limit - 5)
@@ -104,13 +97,12 @@ def solve(N, K, Q, Gamma, s, tw_lo, tw_hi, T, C, all_int_times, time_limit=300):
     for (i, j) in A:
         x[i, j] = model.addVar(vtype=g.GRB.BINARY, name=f"x_{i}_{j}")
 
-    # tau[i] — service start time; INTEGER when all time data is integral
-    time_vtype = g.GRB.INTEGER if all_int_times else g.GRB.CONTINUOUS
+    # tau[i] — service start time
     tau = {}
     for i in V:
         lb = tw_lo[i] if i > 0 else 0
         ub = tw_hi[i] if i > 0 else 0
-        tau[i] = model.addVar(lb=lb, ub=ub, vtype=time_vtype, name=f"tau_{i}")
+        tau[i] = model.addVar(lb=lb, ub=ub, vtype=g.GRB.INTEGER, name=f"tau_{i}")
 
     # w[i] — cumulative load; INTEGER since demands and capacity are int
     w = {}
@@ -218,8 +210,8 @@ def main():
     output_file = sys.argv[2]
     time_limit = float(sys.argv[3]) if len(sys.argv) > 3 else 300
 
-    N, K, Q, Gamma, s, tw_lo, tw_hi, T, C, all_int_times = parse_input(input_file)
-    obj_val, routes = solve(N, K, Q, Gamma, s, tw_lo, tw_hi, T, C, all_int_times, time_limit)
+    N, K, Q, Gamma, s, tw_lo, tw_hi, T, C = parse_input(input_file)
+    obj_val, routes = solve(N, K, Q, Gamma, s, tw_lo, tw_hi, T, C, time_limit)
 
     if obj_val is None:
         with open(output_file, 'w') as f:

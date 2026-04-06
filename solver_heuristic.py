@@ -5,15 +5,14 @@ import math
 import time
 import numpy as np
 
-# ─── Global problem data (NumPy arrays for fast access) ───
 N = K = Q = 0
 Gamma = 0.0
-dem = None       # demand[i], shape (N+1,)
-tw_low = None    # tw_low[i], shape (N+1,)
-tw_high = None   # tw_high[i], shape (N+1,)
-ttime = None     # travel time matrix, shape (N+1, N+1)
-cost_mat = None  # cost matrix, shape (N+1, N+1)
-neighbors = None # neighbors[i] = sorted indices by distance, shape (N+1, N+1)
+dem = None       # demand[i]
+tw_low = None    # tw_low[i]
+tw_high = None   # tw_high[i]
+ttime = None     # travel time matrix
+cost_mat = None  # cost matrix
+neighbors = None # neighbors[i] = sorted indices by distance
 
 start_time = 0.0
 TIME_LIMIT = 300.0
@@ -23,10 +22,8 @@ rng = np.random.default_rng(42)
 def elapsed():
     return time.monotonic() - start_time
 
-
 def time_remaining():
     return TIME_LIMIT - elapsed()
-
 
 def parse_input(filepath):
     global N, K, Q, Gamma, dem, tw_low, tw_high, ttime, cost_mat, neighbors
@@ -58,14 +55,9 @@ def parse_input(filepath):
         for j in range(N + 1):
             cost_mat[i][j] = float(nxt())
 
-    # Depot time window
     tw_high[0] = max(tw_high[i] + ttime[i][0] for i in range(1, N + 1))
-
-    # Pre-sorted neighbor lists by distance (for Shaw/string removal)
     neighbors = np.argsort(cost_mat, axis=1)
 
-
-# ─── Route class with Forward Time Slack ───
 
 class Route:
     __slots__ = ['customers', 'load', 'cost', 'earliest', 'fts', 'waiting']
@@ -81,12 +73,10 @@ class Route:
             self.recompute()
 
     def recompute(self):
-        """O(m) full recomputation of schedule, cost, and forward time slack."""
         custs = self.customers
         m = len(custs)
         self.load = sum(dem[c] for c in custs)
 
-        # Forward pass: earliest arrival times and waiting
         self.earliest = [0.0] * m
         self.waiting = [0.0] * m
         self.cost = 0.0
@@ -103,7 +93,6 @@ class Route:
             prev = c
         self.cost += cost_mat[prev][0]
 
-        # Backward pass: forward time slack
         self.fts = [0.0] * m
         if m > 0:
             self.fts[m - 1] = tw_high[custs[m - 1]] - self.earliest[m - 1]
@@ -122,13 +111,11 @@ class Route:
         return True
 
     def can_insert(self, pos, u):
-        """O(1) insertion feasibility check (after recompute). Returns (feasible, delta_cost)."""
         m = len(self.customers)
 
         if self.load + dem[u] > Q:
             return False, float('inf')
 
-        # Predecessor
         if pos == 0:
             prev_node = 0
             prev_dep = 0.0
@@ -136,13 +123,11 @@ class Route:
             prev_node = self.customers[pos - 1]
             prev_dep = self.earliest[pos - 1]
 
-        # Arrival at u
         arr_u = prev_dep + ttime[prev_node][u]
         start_u = max(arr_u, tw_low[u])
         if start_u > tw_high[u] + 1e-9:
             return False, float('inf')
 
-        # Successor and push-forward check
         if pos < m:
             next_node = self.customers[pos]
             new_arr_next = start_u + ttime[u][next_node]
@@ -151,7 +136,6 @@ class Route:
                 return False, float('inf')
             delta = cost_mat[prev_node][u] + cost_mat[u][next_node] - cost_mat[prev_node][next_node]
         else:
-            # Insert at end (before depot return)
             delta = cost_mat[prev_node][u] + cost_mat[u][0] - cost_mat[prev_node][0]
 
         return True, delta
@@ -174,9 +158,6 @@ class Route:
         r.fts = self.fts[:]
         r.waiting = self.waiting[:]
         return r
-
-
-# ─── Solution class ───
 
 class Solution:
     __slots__ = ['routes', 'total_cost', 'num_vans']
@@ -211,14 +192,10 @@ class Solution:
             result.extend(r.customers)
         return result
 
-
-# ─── Construction: Regret-2 insertion ───
-
 def construct_regret2():
     sol = Solution()
     unassigned = set(range(1, N + 1))
 
-    # Start with one empty route
     sol.routes = [Route()]
 
     while unassigned:
@@ -262,13 +239,9 @@ def construct_regret2():
             sol.routes[best_ri].insert(best_pos, best_u)
         unassigned.discard(best_u)
 
-    # Remove empty routes
     sol.routes = [r for r in sol.routes if r.customers]
     sol.recompute_objective()
     return sol
-
-
-# ─── Destroy operators ───
 
 def get_destroy_size():
     lo = max(1, int(0.1 * N))
@@ -320,7 +293,6 @@ def shaw_removal(sol, removed_set, p=6):
     seed = int(rng.choice(all_custs))
     to_remove = {seed}
 
-    # Compute relatedness
     max_cost = float(np.max(cost_mat)) or 1.0
     max_tw = float(np.max(tw_high[1:])) - float(np.min(tw_low[1:])) or 1.0
     max_dem = float(np.max(dem[1:])) - float(np.min(dem[1:])) or 1.0
@@ -338,11 +310,9 @@ def shaw_removal(sol, removed_set, p=6):
     for _, c in relatedness:
         if len(to_remove) >= q:
             break
-        # Randomized selection
         if rng.random() ** p < 0.5:
             to_remove.add(c)
 
-    # If not enough, just take from sorted list
     if len(to_remove) < q:
         for _, c in relatedness:
             if c not in to_remove:
@@ -355,7 +325,6 @@ def shaw_removal(sol, removed_set, p=6):
 
 
 def string_removal(sol, removed_set):
-    """SISRs-style string removal: remove contiguous subsequences from nearby routes."""
     q = get_destroy_size()
     all_custs = [c for c in sol.all_customers() if c not in removed_set]
     if not all_custs:
@@ -371,7 +340,6 @@ def string_removal(sol, removed_set):
     ruined_routes = set()
     removed = []
 
-    # Go through neighbors of seed
     for nb_idx in range(1, N + 1):
         if len(ruined_routes) >= k or len(removed) >= q:
             break
@@ -398,17 +366,13 @@ def string_removal(sol, removed_set):
 
 
 def _remove_customers(sol, removed_set):
-    """Remove all customers in removed_set from solution routes."""
     for r in sol.routes:
         r.customers = [c for c in r.customers if c not in removed_set]
         r.recompute()
     sol.routes = [r for r in sol.routes if r.customers]
 
 
-# ─── Repair operators ───
-
 def greedy_insertion(sol, removed):
-    """Insert removed customers greedily (cheapest feasible position)."""
     removed_list = list(removed)
     rng.shuffle(removed_list)
 
@@ -436,7 +400,6 @@ def greedy_insertion(sol, removed):
 
 
 def regret2_insertion(sol, removed):
-    """Insert removed customers by regret-2 heuristic."""
     unassigned = set(removed)
 
     while unassigned:
@@ -481,7 +444,6 @@ def regret2_insertion(sol, removed):
 
 
 def noisy_greedy_insertion(sol, removed):
-    """Greedy insertion with noise for diversification."""
     d_max = float(np.max(cost_mat))
     eta = 0.025
     removed_list = list(removed)
@@ -512,11 +474,7 @@ def noisy_greedy_insertion(sol, removed):
     removed.clear()
     sol.recompute_objective()
 
-
-# ─── Local search ───
-
 def local_search(sol):
-    """First-improvement local search: relocate, swap, or-opt."""
     improved = True
     max_passes = 3
     passes = 0
@@ -524,12 +482,10 @@ def local_search(sol):
         improved = False
         passes += 1
 
-        # Intra-route or-opt(1): relocate within same route
         for r in sol.routes:
             if _intra_relocate(r):
                 improved = True
 
-        # Inter-route relocate
         n_routes = len(sol.routes)
         for i in range(n_routes):
             for j in range(n_routes):
@@ -538,7 +494,6 @@ def local_search(sol):
                 if _inter_relocate(sol.routes[i], sol.routes[j]):
                     improved = True
 
-        # Inter-route swap
         for i in range(n_routes):
             for j in range(i + 1, n_routes):
                 if not sol.routes[i].customers or not sol.routes[j].customers:
@@ -551,7 +506,6 @@ def local_search(sol):
 
 
 def _intra_relocate(route):
-    """Move a customer to a better position within the same route."""
     m = len(route.customers)
     if m <= 1:
         return False
@@ -583,7 +537,6 @@ def _intra_relocate(route):
 
 
 def _inter_relocate(r1, r2):
-    """Move a customer from r1 to r2 if it improves total cost."""
     for ci in range(len(r1.customers)):
         c = r1.customers[ci]
         # Removal saving from r1
@@ -603,7 +556,6 @@ def _inter_relocate(r1, r2):
 
 
 def _inter_swap(r1, r2):
-    """Swap one customer between two routes if it improves cost."""
     for i in range(len(r1.customers)):
         c1 = r1.customers[i]
         for j in range(len(r2.customers)):
@@ -630,17 +582,13 @@ def _inter_swap(r1, r2):
             r2.recompute()
     return False
 
-
-# ─── Van minimization ───
-
 def try_reduce_vans(sol):
-    """Try to empty the smallest route by redistributing its customers."""
     if len(sol.routes) <= 1:
         return False
 
     sol.routes.sort(key=lambda r: len(r.customers))
 
-    for ri in range(min(3, len(sol.routes))):  # try the 3 smallest routes
+    for ri in range(min(3, len(sol.routes))):
         route = sol.routes[ri]
         customers_to_move = route.customers[:]
         other_routes = [r.copy() for r in sol.routes if r is not route]
@@ -673,9 +621,6 @@ def try_reduce_vans(sol):
 
     return False
 
-
-# ─── ALNS main loop ───
-
 def solve():
     global start_time, TIME_LIMIT
     start_time = time.monotonic()
@@ -687,7 +632,7 @@ def solve():
 
     parse_input(input_file)
 
-    # Phase 1: Construction
+    # Construction
     current = construct_regret2()
     best = current.copy()
     best_obj = best.total_cost
@@ -711,7 +656,6 @@ def solve():
     DECAY = 0.1
     SEGMENT_SIZE = 100
 
-    # SA parameters: calibrate initial temp so 5% worse is accepted at 50%
     init_obj = max(current.total_cost, 1e-6)
     temperature = -0.05 * init_obj / math.log(0.5)
     cooling = 0.99975
@@ -729,7 +673,7 @@ def solve():
                 return i
         return len(weights) - 1
 
-    # Phase 2: ALNS main loop
+    # ALNS main loop
     while time_remaining() > 1.5:
         di = select_op(d_weights)
         ri_op = select_op(r_weights)
@@ -802,7 +746,7 @@ def solve():
         temperature *= cooling
         iteration += 1
 
-    # Phase 3: Final polish
+    # Final polish
     if time_remaining() > 1.0:
         current = best.copy()
         local_search(current)
