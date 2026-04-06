@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""CVRPTW Optimal ILP Solver (SP_CC_O) using Gurobi."""
 import sys
 import gurobipy as g
 
 
 def parse_input(filepath):
-    """Parse CVRPTW instance from file. Returns problem data."""
     with open(filepath, 'r') as f:
         tokens = f.read().split()
     idx = 0
@@ -23,45 +21,36 @@ def parse_input(filepath):
     Q = next_int()
     Gamma = next_float()
 
-    # Customer data (1-indexed: customers 1..N)
-    s = [0] * (N + 1)       # parcel sizes, s[0]=0 for depot
-    tw_lo = [0.0] * (N + 1) # time window lower bounds
-    tw_hi = [0.0] * (N + 1) # time window upper bounds
+    s = [0] * (N + 1)
+    tw_lo = [0.0] * (N + 1)
+    tw_hi = [0.0] * (N + 1)
     for i in range(1, N + 1):
         s[i] = next_int()
         tw_lo[i] = next_float()
         tw_hi[i] = next_float()
 
-    # Travel time matrix (N+1) x (N+1)
     T = []
     for i in range(N + 1):
-        row = [next_float() for _ in range(N + 1)]
-        T.append(row)
+        T.append([next_float() for _ in range(N + 1)])
 
-    # Cost matrix (N+1) x (N+1)
     C = []
     for i in range(N + 1):
-        row = [next_float() for _ in range(N + 1)]
-        C.append(row)
+        C.append([next_float() for _ in range(N + 1)])
 
-    # Depot time window: can depart at time 0, return by latest feasible time
     tw_hi[0] = max(tw_hi[i] + T[i][0] for i in range(1, N + 1))
 
     return N, K, Q, Gamma, s, tw_lo, tw_hi, T, C
 
 
 def validate(N, K, Q, Gamma, s, tw_lo, tw_hi, T, C, obj_val, routes):
-    """Validate a CVRPTW solution. Returns (is_valid, message)."""
     visited = set()
     computed_cost = 0.0
 
     for ri, route in enumerate(routes):
-        # Check capacity
         load = sum(s[cust] for cust, _ in route)
         if load > Q:
             return False, f"Route {ri}: capacity {load} > {Q}"
 
-        # Check time windows and travel time consistency
         prev_node = 0
         prev_departure = 0.0
         for ci, (cust, arr_time) in enumerate(route):
@@ -69,37 +58,29 @@ def validate(N, K, Q, Gamma, s, tw_lo, tw_hi, T, C, obj_val, routes):
                 return False, f"Customer {cust} visited more than once"
             visited.add(cust)
 
-            # Arrival must be >= departure from prev + travel time
             earliest_arrival = prev_departure + T[prev_node][cust]
             if arr_time < earliest_arrival - 1e-6:
                 return False, f"Route {ri}, stop {ci}: arrival {arr_time} < earliest {earliest_arrival}"
-
-            # Time window check
             if arr_time < tw_lo[cust] - 1e-6:
                 return False, f"Route {ri}, stop {ci}: arrival {arr_time} < tw_lo {tw_lo[cust]}"
             if arr_time > tw_hi[cust] + 1e-6:
                 return False, f"Route {ri}, stop {ci}: arrival {arr_time} > tw_hi {tw_hi[cust]}"
 
             prev_node = cust
-            prev_departure = arr_time  # delivery time = arrival time (service time = 0)
+            prev_departure = arr_time
 
-        # Add travel costs for this route
         prev = 0
         for cust, _ in route:
             computed_cost += C[prev][cust]
             prev = cust
-        computed_cost += C[prev][0]  # return to depot
+        computed_cost += C[prev][0]
 
-    # Check all customers visited
     if visited != set(range(1, N + 1)):
         missing = set(range(1, N + 1)) - visited
         return False, f"Customers not visited: {missing}"
-
-    # Check van count
     if len(routes) > K:
         return False, f"Too many vans: {len(routes)} > {K}"
 
-    # Check objective
     computed_cost += Gamma * len(routes)
     if abs(computed_cost - obj_val) > 1e-3:
         return False, f"Objective mismatch: computed {computed_cost} != reported {obj_val}"
@@ -110,7 +91,6 @@ def validate(N, K, Q, Gamma, s, tw_lo, tw_hi, T, C, obj_val, routes):
 def write_output(filepath, obj_val, routes):
     """Write solution in compact format."""
     lines = []
-    # Format objective: use .1f if it has a fractional part, else int-like
     if obj_val == int(obj_val):
         lines.append(f"{obj_val:.1f} {len(routes)}")
     else:
@@ -119,7 +99,6 @@ def write_output(filepath, obj_val, routes):
     for route in routes:
         parts = [str(len(route))]
         for cust, arr_time in route:
-            # Format arrival time as int if whole number
             if arr_time == int(arr_time):
                 parts.append(f"{cust} {int(arr_time)}")
             else:
@@ -131,114 +110,122 @@ def write_output(filepath, obj_val, routes):
 
 
 def solve_ilp(N, K, Q, Gamma, s, tw_lo, tw_hi, T, C, time_limit=300):
-    """Solve CVRPTW optimally using Gurobi ILP."""
+    """Solve CVRPTW optimally using 2-index MTZ formulation."""
     model = g.Model("CVRPTW")
     model.Params.OutputFlag = 0
     model.Params.MIPGap = 0
+    model.Params.MIPGapAbs = 0
     model.Params.TimeLimit = time_limit
+    model.Params.IntegralityFocus = 1
+    model.Params.Presolve = 2
+    model.Params.Cuts = 2
+    model.Params.MIPFocus = 2
 
-    nodes = range(N + 1)      # 0 = depot, 1..N = customers
-    customers = range(1, N + 1)
-    vans = range(K)
+    V = range(N + 1)
+    Cust = range(1, N + 1)
 
-    # Precompute feasible arcs (arc i->j is feasible if earliest arrival at j <= tw_hi[j])
-    # For customer i: earliest departure = tw_lo[i], so earliest arrival at j = tw_lo[i] + T[i][j]
-    # For depot (i=0): earliest departure = 0, so earliest arrival at j = T[0][j]
-    feasible = {}
-    for i in nodes:
-        for j in nodes:
+    # Precompute feasible arc set — eliminate arcs that violate time windows
+    # Arc (i,j) feasible if: earliest_departure_i + T[i][j] <= tw_hi[j]
+    # Service time = 0, so earliest_departure_i = tw_lo[i] (or 0 for depot)
+    A = []
+    A_set = set()
+    for i in V:
+        for j in V:
             if i == j:
                 continue
-            earliest_dep_i = tw_lo[i] if i > 0 else 0
-            if earliest_dep_i + T[i][j] <= tw_hi[j] + 1e-9:
-                feasible[i, j] = True
+            ed_i = tw_lo[i] if i > 0 else 0
+            if ed_i + T[i][j] <= tw_hi[j] + 1e-9:
+                A.append((i, j))
+                A_set.add((i, j))
 
-    # Decision variables
-    # x[k,i,j] = 1 if van k travels from i to j
+    # Big-M per arc: M_ij = max(0, tw_hi[i] + T[i][j] - tw_lo[j])
+    M = {}
+    for (i, j) in A:
+        ub_i = tw_hi[i] if i > 0 else tw_hi[0]
+        lb_j = tw_lo[j] if j > 0 else 0
+        M[i, j] = max(0, ub_i + T[i][j] - lb_j)
+
+    # ─── Decision variables ───
+
+    # x[i,j] binary — any vehicle traverses arc (i,j)
     x = {}
-    for k in vans:
-        for (i, j) in feasible:
-            x[k, i, j] = model.addVar(vtype=g.GRB.BINARY, name=f"x_{k}_{i}_{j}")
+    for (i, j) in A:
+        x[i, j] = model.addVar(vtype=g.GRB.BINARY, name=f"x_{i}_{j}")
 
-    # t[k,i] = arrival time of van k at node i
-    t = {}
-    for k in vans:
-        for i in nodes:
-            lb = tw_lo[i] if i > 0 else 0
-            ub = tw_hi[i] if i > 0 else tw_hi[0]
-            t[k, i] = model.addVar(lb=lb, ub=ub, vtype=g.GRB.CONTINUOUS, name=f"t_{k}_{i}")
+    # tau[i] continuous — service start time at node i
+    tau = {}
+    for i in V:
+        lb = tw_lo[i] if i > 0 else 0
+        ub = tw_hi[i] if i > 0 else 0  # depot fixed at time 0
+        tau[i] = model.addVar(lb=lb, ub=ub, vtype=g.GRB.CONTINUOUS, name=f"tau_{i}")
 
-    # y[k] = 1 if van k is used
-    y = {}
-    for k in vans:
-        y[k] = model.addVar(vtype=g.GRB.BINARY, name=f"y_{k}")
+    # w[i] continuous — cumulative load upon arriving at customer i
+    w = {}
+    w[0] = model.addVar(lb=0, ub=0, vtype=g.GRB.CONTINUOUS, name="w_0")
+    for i in Cust:
+        w[i] = model.addVar(lb=s[i], ub=Q, vtype=g.GRB.CONTINUOUS, name=f"w_{i}")
 
     model.update()
 
-    # Objective: minimize travel cost + van usage cost
+    # Branch priority: arc variables first
+    for key in x:
+        x[key].BranchPriority = 10
+
+    # ─── Objective ───
+    # Travel cost + Gamma per van (van count = sum of x[0,j])
     model.setObjective(
-        g.quicksum(C[i][j] * x[k, i, j] for (k, i, j) in x) +
-        Gamma * g.quicksum(y[k] for k in vans),
+        g.quicksum(C[i][j] * x[i, j] for (i, j) in A) +
+        Gamma * g.quicksum(x[0, j] for j in Cust if (0, j) in A_set),
         g.GRB.MINIMIZE
     )
 
-    # Constraint 1: Each customer visited exactly once
-    for i in customers:
+    # ─── Constraints ───
+
+    # C1: Visit each customer exactly once (in-degree = 1)
+    for j in Cust:
         model.addConstr(
-            g.quicksum(x[k, j, i] for k in vans for j in nodes
-                       if (k, j, i) in x) == 1,
-            name=f"visit_{i}"
+            g.quicksum(x[i, j] for i in V if (i, j) in A_set) == 1,
+            name=f"visit_{j}"
         )
 
-    # Constraint 2: Flow conservation for each van at each customer
-    for k in vans:
-        for i in customers:
-            model.addConstr(
-                g.quicksum(x[k, j, i] for j in nodes if (k, j, i) in x) ==
-                g.quicksum(x[k, i, j] for j in nodes if (k, i, j) in x),
-                name=f"flow_{k}_{i}"
-            )
-
-    # Constraint 3: Depot flow — each van leaves and returns at most once
-    for k in vans:
+    # C2: Flow conservation at each customer
+    for j in Cust:
         model.addConstr(
-            g.quicksum(x[k, 0, j] for j in customers if (k, 0, j) in x) == y[k],
-            name=f"depot_out_{k}"
-        )
-        model.addConstr(
-            g.quicksum(x[k, i, 0] for i in customers if (k, i, 0) in x) == y[k],
-            name=f"depot_in_{k}"
+            g.quicksum(x[i, j] for i in V if (i, j) in A_set) ==
+            g.quicksum(x[j, k] for k in V if (j, k) in A_set),
+            name=f"flow_{j}"
         )
 
-    # Constraint 4: Capacity per van
-    for k in vans:
-        model.addConstr(
-            g.quicksum(
-                s[i] * g.quicksum(x[k, j, i] for j in nodes if (k, j, i) in x)
-                for i in customers
-            ) <= Q,
-            name=f"cap_{k}"
-        )
+    # C3: Depot flow balance + vehicle limit
+    model.addConstr(
+        g.quicksum(x[0, j] for j in Cust if (0, j) in A_set) ==
+        g.quicksum(x[j, 0] for j in Cust if (j, 0) in A_set),
+        name="depot_balance"
+    )
+    model.addConstr(
+        g.quicksum(x[0, j] for j in Cust if (0, j) in A_set) <= K,
+        name="max_vans"
+    )
 
-    # Constraint 5: Time propagation with Big-M
-    # Skip arcs returning to depot (j=0) — t[k,0] is departure time, not return time
-    for (k, i, j) in x:
+    # C4: Time precedence (MTZ subtour elimination), only for customer nodes
+    for (i, j) in A:
         if j == 0:
             continue  # no time constraint on return to depot
-        # M[i][j] = max(0, tw_hi[i] + T[i][j] - tw_lo[j])
-        ub_i = tw_hi[i] if i > 0 else tw_hi[0]
-        lb_j = tw_lo[j]
-        M = max(0, ub_i + T[i][j] - lb_j)
         model.addConstr(
-            t[k, j] >= t[k, i] + T[i][j] - M * (1 - x[k, i, j]),
-            name=f"time_{k}_{i}_{j}"
+            tau[i] + T[i][j] - M[i, j] * (1 - x[i, j]) <= tau[j],
+            name=f"time_{i}_{j}"
         )
 
-    # Constraint 6: Symmetry breaking — order vans
-    for k in range(K - 1):
-        model.addConstr(y[k] >= y[k + 1], name=f"sym_{k}")
+    # C5: Capacity tracking (MTZ-style)
+    for (i, j) in A:
+        if j == 0:
+            continue  # no capacity needed for depot return
+        model.addConstr(
+            w[j] >= w[i] + s[j] - Q * (1 - x[i, j]),
+            name=f"cap_{i}_{j}"
+        )
 
-    # Solve
+    # ─── Solve ───
     model.optimize()
 
     if model.Status == g.GRB.INFEASIBLE:
@@ -249,32 +236,31 @@ def solve_ilp(N, K, Q, Gamma, s, tw_lo, tw_hi, T, C, time_limit=300):
         print("No solution found!", file=sys.stderr)
         sys.exit(1)
 
-    # Extract solution
+    # ─── Extract solution ───
     obj_val = model.ObjVal
+
+    # Build adjacency from solution arcs
+    adj = {}
+    for (i, j) in A:
+        if x[i, j].X > 0.5:
+            adj[i] = j
+
+    # Reconstruct routes by following chains from depot
     routes = []
-    for k in vans:
-        if y[k].X < 0.5:
+    for j in Cust:
+        if (0, j) not in A_set:
             continue
-        # Follow the route from depot
+        if x[0, j].X < 0.5:
+            continue
+        # New route starting with customer j
         route = []
-        current = 0
-        while True:
-            next_node = None
-            for j in nodes:
-                if (k, current, j) in x and x[k, current, j].X > 0.5:
-                    next_node = j
-                    break
-            if next_node is None or next_node == 0:
-                break
-            arrival = t[k, next_node].X
-            # Snap arrival to tw_lo if it's just below due to floating point
-            if arrival < tw_lo[next_node] - 1e-9:
-                arrival = tw_lo[next_node]
-            arrival = max(arrival, tw_lo[next_node])
-            route.append((next_node, arrival))
-            current = next_node
-        if route:
-            routes.append(route)
+        current = j
+        while current != 0:
+            arrival = tau[current].X
+            arrival = max(arrival, tw_lo[current])
+            route.append((current, arrival))
+            current = adj.get(current, 0)
+        routes.append(route)
 
     return obj_val, routes
 
@@ -287,7 +273,6 @@ def main():
     N, K, Q, Gamma, s, tw_lo, tw_hi, T, C = parse_input(input_file)
     obj_val, routes = solve_ilp(N, K, Q, Gamma, s, tw_lo, tw_hi, T, C, time_limit)
 
-    # Validate before writing
     valid, msg = validate(N, K, Q, Gamma, s, tw_lo, tw_hi, T, C, obj_val, routes)
     if not valid:
         print(f"WARNING: Solution validation failed: {msg}", file=sys.stderr)

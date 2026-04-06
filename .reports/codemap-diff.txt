@@ -1,0 +1,29 @@
+Codemap Generation Report — 2026-04-06
+========================================
+
+Status: Initial generation (no previous codemaps)
+
+Files scanned:
+  - solver.py (289 lines) — Optimal ILP solver
+  - solver_heuristic.py (845 lines) — ALNS heuristic solver
+
+Data directories:
+  - data/CC-O/ (2 instances, 2 solutions)
+  - data/CC-T/ (4 instances, 4 solutions)
+
+Codemaps generated:
+  - docs/CODEMAPS/architecture.md — System overview, data flow, CLI interface
+  - docs/CODEMAPS/backend.md — Solver internals, algorithms, operators
+  - docs/CODEMAPS/dependencies.md — External packages, license requirements
+
+Skipped (not applicable):
+  - frontend.md — No frontend code
+  - data.md — No database; input/output is file-based
+
+Dependencies detected:
+  - gurobipy (Gurobi MIP solver)
+  - numpy
+
+Architecture notes:
+  - Two independent solvers sharing identical I/O format
+  - No shared library code (parse/validate/write duplicated across files)

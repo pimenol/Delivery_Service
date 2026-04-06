@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
-"""CVRPTW Heuristic Solver (SP_CC_T / SP_CC_R) using ALNS."""
+"""CVRPTW Heuristic Solver (SP_CC_T / SP_CC_R) — ALNS with FTS + string removal."""
 import sys
 import math
-import random
 import time
+import numpy as np
 
-# ─── Global problem data ───
+# ─── Global problem data (NumPy arrays for fast access) ───
 N = K = Q = 0
 Gamma = 0.0
-s = []
-tw_lo = []
-tw_hi = []
-T = []
-C = []
+dem = None       # demand[i], shape (N+1,)
+tw_low = None    # tw_low[i], shape (N+1,)
+tw_high = None   # tw_high[i], shape (N+1,)
+ttime = None     # travel time matrix, shape (N+1, N+1)
+cost_mat = None  # cost matrix, shape (N+1, N+1)
+neighbors = None # neighbors[i] = sorted indices by distance, shape (N+1, N+1)
 
 start_time = 0.0
 TIME_LIMIT = 300.0
+rng = np.random.default_rng(42)
 
 
 def elapsed():
@@ -27,391 +29,216 @@ def time_remaining():
 
 
 def parse_input(filepath):
-    global N, K, Q, Gamma, s, tw_lo, tw_hi, T, C
+    global N, K, Q, Gamma, dem, tw_low, tw_high, ttime, cost_mat, neighbors
     with open(filepath, 'r') as f:
         tokens = f.read().split()
     idx = 0
 
-    def next_val():
+    def nxt():
         nonlocal idx
-        val = tokens[idx]; idx += 1; return val
+        v = tokens[idx]; idx += 1; return v
 
-    N = int(next_val())
-    K = int(next_val())
-    Q = int(next_val())
-    Gamma = float(next_val())
+    N = int(nxt()); K = int(nxt()); Q = int(nxt()); Gamma = float(nxt())
 
-    s = [0] * (N + 1)
-    tw_lo = [0.0] * (N + 1)
-    tw_hi = [0.0] * (N + 1)
+    dem = np.zeros(N + 1, dtype=np.float64)
+    tw_low = np.zeros(N + 1, dtype=np.float64)
+    tw_high = np.zeros(N + 1, dtype=np.float64)
     for i in range(1, N + 1):
-        s[i] = int(next_val())
-        tw_lo[i] = float(next_val())
-        tw_hi[i] = float(next_val())
+        dem[i] = int(nxt())
+        tw_low[i] = float(nxt())
+        tw_high[i] = float(nxt())
 
-    T = []
+    ttime = np.zeros((N + 1, N + 1), dtype=np.float64)
     for i in range(N + 1):
-        row = [float(next_val()) for _ in range(N + 1)]
-        T.append(row)
+        for j in range(N + 1):
+            ttime[i][j] = float(nxt())
 
-    C = []
+    cost_mat = np.zeros((N + 1, N + 1), dtype=np.float64)
     for i in range(N + 1):
-        row = [float(next_val()) for _ in range(N + 1)]
-        C.append(row)
+        for j in range(N + 1):
+            cost_mat[i][j] = float(nxt())
+
+    # Depot time window
+    tw_high[0] = max(tw_high[i] + ttime[i][0] for i in range(1, N + 1))
+
+    # Pre-sorted neighbor lists by distance (for Shaw/string removal)
+    neighbors = np.argsort(cost_mat, axis=1)
 
 
-# ─── Route class ───
+# ─── Route class with Forward Time Slack ───
 
 class Route:
-    __slots__ = ['customers', 'load', 'cost', 'arrival']
+    __slots__ = ['customers', 'load', 'cost', 'earliest', 'fts', 'waiting']
 
     def __init__(self, customers=None):
         self.customers = customers if customers is not None else []
         self.load = 0
         self.cost = 0.0
-        self.arrival = []
+        self.earliest = []
+        self.fts = []
+        self.waiting = []
         if self.customers:
             self.recompute()
 
     def recompute(self):
-        self.load = 0
+        """O(m) full recomputation of schedule, cost, and forward time slack."""
+        custs = self.customers
+        m = len(custs)
+        self.load = sum(dem[c] for c in custs)
+
+        # Forward pass: earliest arrival times and waiting
+        self.earliest = [0.0] * m
+        self.waiting = [0.0] * m
         self.cost = 0.0
-        self.arrival = []
+
         prev = 0
         dep = 0.0
-        for c in self.customers:
-            self.load += s[c]
-            arr = dep + T[prev][c]
-            arr = max(arr, tw_lo[c])
-            self.arrival.append(arr)
-            self.cost += C[prev][c]
-            dep = arr
+        for i in range(m):
+            c = custs[i]
+            phys_arr = dep + ttime[prev][c]
+            self.earliest[i] = max(phys_arr, tw_low[c])
+            self.waiting[i] = max(0.0, tw_low[c] - phys_arr)
+            self.cost += cost_mat[prev][c]
+            dep = self.earliest[i]
             prev = c
-        self.cost += C[prev][0]
+        self.cost += cost_mat[prev][0]
+
+        # Backward pass: forward time slack
+        self.fts = [0.0] * m
+        if m > 0:
+            self.fts[m - 1] = tw_high[custs[m - 1]] - self.earliest[m - 1]
+            for i in range(m - 2, -1, -1):
+                self.fts[i] = min(
+                    tw_high[custs[i]] - self.earliest[i],
+                    self.waiting[i + 1] + self.fts[i + 1]
+                )
 
     def is_feasible(self):
         if self.load > Q:
             return False
         for k, c in enumerate(self.customers):
-            if self.arrival[k] > tw_hi[c] + 1e-9:
+            if self.earliest[k] > tw_high[c] + 1e-9:
                 return False
         return True
 
-    def check_insert(self, cust, pos):
-        """Check if inserting cust at pos is feasible. Returns (delta_cost, feasible)."""
-        if self.load + s[cust] > Q:
-            return float('inf'), False
-
+    def can_insert(self, pos, u):
+        """O(1) insertion feasibility check (after recompute). Returns (feasible, delta_cost)."""
         m = len(self.customers)
 
-        # Predecessor departure
+        if self.load + dem[u] > Q:
+            return False, float('inf')
+
+        # Predecessor
         if pos == 0:
             prev_node = 0
             prev_dep = 0.0
         else:
             prev_node = self.customers[pos - 1]
-            prev_dep = self.arrival[pos - 1]
+            prev_dep = self.earliest[pos - 1]
 
-        # Arrival at new customer
-        arr_c = prev_dep + T[prev_node][cust]
-        arr_c = max(arr_c, tw_lo[cust])
-        if arr_c > tw_hi[cust] + 1e-9:
-            return float('inf'), False
+        # Arrival at u
+        arr_u = prev_dep + ttime[prev_node][u]
+        start_u = max(arr_u, tw_low[u])
+        if start_u > tw_high[u] + 1e-9:
+            return False, float('inf')
 
-        dep_c = arr_c
-
-        # Cost delta
+        # Successor and push-forward check
         if pos < m:
             next_node = self.customers[pos]
-            old_cost_seg = C[prev_node][next_node]
-            new_cost_seg = C[prev_node][cust] + C[cust][next_node]
-
-            # Check push-forward propagation on subsequent customers
-            new_arr_next = dep_c + T[cust][next_node]
-            new_arr_next = max(new_arr_next, tw_lo[next_node])
-            push = new_arr_next - self.arrival[pos]
-            if push > 1e-9:
-                for k in range(pos, m):
-                    node_k = self.customers[k]
-                    new_arr_k = self.arrival[k] + push
-                    if new_arr_k > tw_hi[node_k] + 1e-9:
-                        return float('inf'), False
-                    # Absorption by wait time
-                    new_dep_k = max(new_arr_k, tw_lo[node_k])
-                    old_dep_k = self.arrival[k]  # arrival = max(physical_arrival, tw_lo), so departure = arrival
-                    if k + 1 < m:
-                        next_k = self.customers[k + 1]
-                        old_arr_next = self.arrival[k + 1]
-                        new_arr_next_k = new_dep_k + T[node_k][next_k]
-                        new_arr_next_k = max(new_arr_next_k, tw_lo[next_k])
-                        push = new_arr_next_k - old_arr_next
-                        if push <= 1e-9:
-                            break
-            # Also need to update return-to-depot cost if last segment changes
-            delta = new_cost_seg - old_cost_seg
+            new_arr_next = start_u + ttime[u][next_node]
+            push = max(0.0, new_arr_next - self.earliest[pos])
+            if push > self.fts[pos] + 1e-9:
+                return False, float('inf')
+            delta = cost_mat[prev_node][u] + cost_mat[u][next_node] - cost_mat[prev_node][next_node]
         else:
-            # Inserting at end
-            old_cost_seg = C[prev_node][0]
-            new_cost_seg = C[prev_node][cust] + C[cust][0]
-            delta = new_cost_seg - old_cost_seg
+            # Insert at end (before depot return)
+            delta = cost_mat[prev_node][u] + cost_mat[u][0] - cost_mat[prev_node][0]
 
-        return delta, True
+        return True, delta
 
-    def insert(self, cust, pos):
-        self.customers.insert(pos, cust)
+    def insert(self, pos, u):
+        self.customers.insert(pos, u)
         self.recompute()
 
-    def remove(self, pos):
-        cust = self.customers.pop(pos)
+    def remove_at(self, pos):
+        c = self.customers.pop(pos)
         self.recompute()
-        return cust
+        return c
 
     def copy(self):
         r = Route.__new__(Route)
         r.customers = self.customers[:]
         r.load = self.load
         r.cost = self.cost
-        r.arrival = self.arrival[:]
+        r.earliest = self.earliest[:]
+        r.fts = self.fts[:]
+        r.waiting = self.waiting[:]
         return r
 
 
 # ─── Solution class ───
 
 class Solution:
-    def __init__(self, routes=None):
-        self.routes = routes if routes is not None else []
-        self.unassigned = set()
+    __slots__ = ['routes', 'total_cost', 'num_vans']
 
-    def objective(self):
-        return sum(r.cost for r in self.routes) + Gamma * len(self.routes)
+    def __init__(self):
+        self.routes = []
+        self.total_cost = 0.0
+        self.num_vans = 0
+
+    def recompute_objective(self):
+        self.num_vans = len(self.routes)
+        self.total_cost = sum(r.cost for r in self.routes) + Gamma * self.num_vans
 
     def copy(self):
         sol = Solution()
         sol.routes = [r.copy() for r in self.routes]
-        sol.unassigned = set(self.unassigned)
+        sol.total_cost = self.total_cost
+        sol.num_vans = self.num_vans
         return sol
 
+    def find_customer(self, c):
+        """Returns (route_idx, position) for customer c."""
+        for ri, r in enumerate(self.routes):
+            for ci, cust in enumerate(r.customers):
+                if cust == c:
+                    return ri, ci
+        return -1, -1
 
-# ─── Construction Heuristic (Solomon I1) ───
+    def all_customers(self):
+        result = []
+        for r in self.routes:
+            result.extend(r.customers)
+        return result
 
-def construct_initial():
+
+# ─── Construction: Regret-2 insertion ───
+
+def construct_regret2():
     sol = Solution()
-    sol.unassigned = set(range(1, N + 1))
+    unassigned = set(range(1, N + 1))
 
-    while sol.unassigned:
-        # Seed: farthest unassigned customer from depot (by cost)
-        seed = max(sol.unassigned, key=lambda c: C[0][c])
-        route = Route([seed])
-        sol.unassigned.remove(seed)
+    # Start with one empty route
+    sol.routes = [Route()]
 
-        # Greedy insertion
-        improved = True
-        while improved:
-            improved = False
-            best_cust, best_pos, best_delta = None, None, float('inf')
-            for c in sol.unassigned:
-                for pos in range(len(route.customers) + 1):
-                    delta, feas = route.check_insert(c, pos)
-                    if feas and delta < best_delta:
-                        best_cust, best_pos, best_delta = c, pos, delta
-            if best_cust is not None:
-                route.insert(best_cust, best_pos)
-                sol.unassigned.remove(best_cust)
-                improved = True
-
-        sol.routes.append(route)
-
-    return sol
-
-
-# ─── Destroy Operators ───
-
-def get_destroy_size():
-    lo = max(1, int(0.1 * N))
-    hi = max(lo + 1, min(int(0.4 * N), N))
-    return random.randint(lo, hi)
-
-
-def random_removal(sol):
-    q = get_destroy_size()
-    # Collect all customers in routes
-    all_custs = []
-    for ri, r in enumerate(sol.routes):
-        for ci, c in enumerate(r.customers):
-            all_custs.append((ri, ci, c))
-    random.shuffle(all_custs)
-    removed = []
-    to_remove = {}  # ri -> sorted list of positions to remove (descending)
-    for ri, ci, c in all_custs[:q]:
-        removed.append(c)
-        to_remove.setdefault(ri, []).append(ci)
-    # Remove in reverse order to maintain indices
-    for ri in to_remove:
-        for ci in sorted(to_remove[ri], reverse=True):
-            sol.routes[ri].remove(ci)
-    sol.unassigned.update(removed)
-    # Clean empty routes
-    sol.routes = [r for r in sol.routes if r.customers]
-    return removed
-
-
-def worst_removal(sol):
-    q = get_destroy_size()
-    # Compute removal cost for each customer
-    savings = []
-    for ri, r in enumerate(sol.routes):
-        custs = r.customers
-        m = len(custs)
-        for ci in range(m):
-            c = custs[ci]
-            prev = 0 if ci == 0 else custs[ci - 1]
-            nxt = 0 if ci == m - 1 else custs[ci + 1]
-            # Cost saving if removing c
-            old_cost = C[prev][c] + C[c][nxt]
-            new_cost = C[prev][nxt]
-            saving = old_cost - new_cost
-            savings.append((saving, ri, ci, c))
-
-    # Randomized worst: sort by saving descending, pick with bias
-    savings.sort(key=lambda x: -x[0])
-    removed = []
-    removed_set = set()
-    to_remove = {}
-
-    p = 3  # randomization exponent
-    remaining = list(savings)
-    while len(removed) < q and remaining:
-        # Pick with probability proportional to rank^(-p)... simplified: use random index biased to front
-        idx = int(len(remaining) * (random.random() ** p))
-        idx = min(idx, len(remaining) - 1)
-        _, ri, ci, c = remaining.pop(idx)
-        if c not in removed_set:
-            removed.append(c)
-            removed_set.add(c)
-            to_remove.setdefault(ri, []).append(ci)
-
-    for ri in to_remove:
-        for ci in sorted(to_remove[ri], reverse=True):
-            sol.routes[ri].remove(ci)
-    sol.unassigned.update(removed)
-    sol.routes = [r for r in sol.routes if r.customers]
-    return removed
-
-
-def shaw_removal(sol):
-    q = get_destroy_size()
-    # Pick random seed customer
-    all_custs = []
-    for r in sol.routes:
-        all_custs.extend(r.customers)
-    if not all_custs:
-        return []
-
-    seed = random.choice(all_custs)
-    # Compute relatedness (lower = more related)
-    phi1, phi2, phi3 = 9, 3, 2
-    # Normalize by max values
-    max_dist = max(max(row) for row in C) or 1
-    max_tw = max(tw_hi) - min(tw_lo[1:] if N > 0 else [0]) or 1
-    max_s = max(s[1:]) - min(s[1:]) if N > 0 else 1
-    max_s = max(max_s, 1)
-
-    relatedness = []
-    for c in all_custs:
-        if c == seed:
-            continue
-        rel = (phi1 * C[seed][c] / max_dist +
-               phi2 * abs(tw_lo[seed] - tw_lo[c]) / max_tw +
-               phi3 * abs(s[seed] - s[c]) / max_s)
-        relatedness.append((rel, c))
-
-    relatedness.sort()
-    to_remove_set = {seed}
-    for _, c in relatedness:
-        if len(to_remove_set) >= q:
-            break
-        to_remove_set.add(c)
-
-    # Remove from routes
-    for r in sol.routes:
-        r.customers = [c for c in r.customers if c not in to_remove_set]
-        r.recompute()
-    sol.unassigned.update(to_remove_set)
-    sol.routes = [r for r in sol.routes if r.customers]
-    return list(to_remove_set)
-
-
-def tw_removal(sol):
-    q = get_destroy_size()
-    all_custs = []
-    for r in sol.routes:
-        all_custs.extend(r.customers)
-    if not all_custs:
-        return []
-
-    seed = random.choice(all_custs)
-    # Sort by time window similarity
-    by_tw = sorted(all_custs, key=lambda c: abs(tw_lo[c] - tw_lo[seed]))
-    to_remove_set = set(by_tw[:q])
-
-    for r in sol.routes:
-        r.customers = [c for c in r.customers if c not in to_remove_set]
-        r.recompute()
-    sol.unassigned.update(to_remove_set)
-    sol.routes = [r for r in sol.routes if r.customers]
-    return list(to_remove_set)
-
-
-# ─── Repair Operators ───
-
-def greedy_insertion(sol):
-    """Insert all unassigned customers greedily (cheapest insertion)."""
-    unassigned = list(sol.unassigned)
-    random.shuffle(unassigned)
-
-    for c in unassigned:
-        best_delta = float('inf')
-        best_ri = -1
-        best_pos = -1
-
-        for ri, r in enumerate(sol.routes):
-            for pos in range(len(r.customers) + 1):
-                delta, feas = r.check_insert(c, pos)
-                if feas and delta < best_delta:
-                    best_delta = delta
-                    best_ri = ri
-                    best_pos = pos
-
-        # Compare with new route
-        new_route_cost = C[0][c] + C[c][0]
-        new_route_delta = new_route_cost + Gamma  # cost of new route including van cost
-
-        if best_ri >= 0 and best_delta < new_route_delta:
-            sol.routes[best_ri].insert(c, best_pos)
-        else:
-            sol.routes.append(Route([c]))
-
-        sol.unassigned.discard(c)
-
-
-def regret2_insertion(sol):
-    """Insert customers by regret-2 heuristic."""
-    while sol.unassigned:
-        best_customer = None
+    while unassigned:
+        best_u = None
         best_regret = -float('inf')
         best_ri = -1
         best_pos = -1
+        best_delta = float('inf')
 
-        for c in sol.unassigned:
-            insertions = []  # (total_delta, ri, pos)
+        for u in unassigned:
+            insertions = []  # (delta, ri, pos)
             for ri, r in enumerate(sol.routes):
                 for pos in range(len(r.customers) + 1):
-                    delta, feas = r.check_insert(c, pos)
+                    feas, delta = r.can_insert(pos, u)
                     if feas:
                         insertions.append((delta, ri, pos))
-            # New route option
-            new_cost = C[0][c] + C[c][0] + Gamma
-            insertions.append((new_cost, -1, 0))
+
+            # Option: new route
+            new_route_cost = cost_mat[0][u] + cost_mat[u][0] + Gamma
+            insertions.append((new_route_cost, -1, 0))
             insertions.sort(key=lambda x: x[0])
 
             if len(insertions) >= 2:
@@ -419,176 +246,392 @@ def regret2_insertion(sol):
             else:
                 regret = float('inf')
 
-            if regret > best_regret or (regret == best_regret and insertions[0][0] < best_ri):
+            if regret > best_regret or (abs(regret - best_regret) < 1e-9 and insertions[0][0] < best_delta):
                 best_regret = regret
-                best_customer = c
+                best_u = u
                 best_ri = insertions[0][1]
                 best_pos = insertions[0][2]
+                best_delta = insertions[0][0]
 
-        if best_customer is None:
+        if best_u is None:
             break
 
         if best_ri == -1:
-            sol.routes.append(Route([best_customer]))
+            sol.routes.append(Route([best_u]))
         else:
-            sol.routes[best_ri].insert(best_customer, best_pos)
-        sol.unassigned.discard(best_customer)
+            sol.routes[best_ri].insert(best_pos, best_u)
+        unassigned.discard(best_u)
+
+    # Remove empty routes
+    sol.routes = [r for r in sol.routes if r.customers]
+    sol.recompute_objective()
+    return sol
 
 
-# ─── Local Search ───
+# ─── Destroy operators ───
+
+def get_destroy_size():
+    lo = max(1, int(0.1 * N))
+    hi = max(lo + 1, min(int(0.4 * N), N))
+    return rng.integers(lo, hi + 1)
+
+
+def random_removal(sol, removed_set):
+    q = get_destroy_size()
+    all_custs = sol.all_customers()
+    if q > len(all_custs):
+        q = len(all_custs)
+    chosen = rng.choice(all_custs, size=q, replace=False)
+    removed_set.update(chosen)
+    _remove_customers(sol, removed_set)
+
+
+def worst_removal(sol, removed_set, p=3):
+    q = get_destroy_size()
+    for _ in range(q):
+        savings = []
+        for r in sol.routes:
+            custs = r.customers
+            m = len(custs)
+            for ci in range(m):
+                c = custs[ci]
+                if c in removed_set:
+                    continue
+                prev = 0 if ci == 0 else custs[ci - 1]
+                nxt = 0 if ci == m - 1 else custs[ci + 1]
+                saving = cost_mat[prev][c] + cost_mat[c][nxt] - cost_mat[prev][nxt]
+                savings.append((saving, c))
+        if not savings:
+            break
+        savings.sort(key=lambda x: -x[0])
+        idx = int(rng.random() ** p * len(savings))
+        idx = min(idx, len(savings) - 1)
+        removed_set.add(savings[idx][1])
+
+    _remove_customers(sol, removed_set)
+
+
+def shaw_removal(sol, removed_set, p=6):
+    q = get_destroy_size()
+    all_custs = [c for c in sol.all_customers() if c not in removed_set]
+    if not all_custs:
+        return
+
+    seed = int(rng.choice(all_custs))
+    to_remove = {seed}
+
+    # Compute relatedness
+    max_cost = float(np.max(cost_mat)) or 1.0
+    max_tw = float(np.max(tw_high[1:])) - float(np.min(tw_low[1:])) or 1.0
+    max_dem = float(np.max(dem[1:])) - float(np.min(dem[1:])) or 1.0
+
+    relatedness = []
+    for c in all_custs:
+        if c == seed:
+            continue
+        rel = (9 * cost_mat[seed][c] / max_cost +
+               3 * abs(tw_low[seed] - tw_low[c]) / max_tw +
+               2 * abs(dem[seed] - dem[c]) / max_dem)
+        relatedness.append((rel, c))
+    relatedness.sort()
+
+    for _, c in relatedness:
+        if len(to_remove) >= q:
+            break
+        # Randomized selection
+        if rng.random() ** p < 0.5:
+            to_remove.add(c)
+
+    # If not enough, just take from sorted list
+    if len(to_remove) < q:
+        for _, c in relatedness:
+            if c not in to_remove:
+                to_remove.add(c)
+            if len(to_remove) >= q:
+                break
+
+    removed_set.update(to_remove)
+    _remove_customers(sol, removed_set)
+
+
+def string_removal(sol, removed_set):
+    """SISRs-style string removal: remove contiguous subsequences from nearby routes."""
+    q = get_destroy_size()
+    all_custs = [c for c in sol.all_customers() if c not in removed_set]
+    if not all_custs:
+        return
+
+    seed = int(rng.choice(all_custs))
+
+    avg_route_len = np.mean([len(r.customers) for r in sol.routes]) if sol.routes else 1
+    l_max = min(10, max(1, int(avg_route_len)))
+    k_max = max(1, int(4 * q / (1 + l_max)) - 1)
+    k = rng.integers(1, k_max + 1)
+
+    ruined_routes = set()
+    removed = []
+
+    # Go through neighbors of seed
+    for nb_idx in range(1, N + 1):
+        if len(ruined_routes) >= k or len(removed) >= q:
+            break
+        c = int(neighbors[seed][nb_idx])
+        if c == 0 or c in removed_set:
+            continue
+
+        ri, ci = sol.find_customer(c)
+        if ri < 0 or ri in ruined_routes:
+            continue
+
+        r = sol.routes[ri]
+        m = len(r.customers)
+        l = rng.integers(1, min(l_max, m) + 1)
+        start = max(0, ci - l + 1)
+        start = rng.integers(start, min(ci, m - l) + 1)
+        end = start + l
+        string = r.customers[start:end]
+        removed.extend(string)
+        ruined_routes.add(ri)
+
+    removed_set.update(removed[:q])
+    _remove_customers(sol, removed_set)
+
+
+def _remove_customers(sol, removed_set):
+    """Remove all customers in removed_set from solution routes."""
+    for r in sol.routes:
+        r.customers = [c for c in r.customers if c not in removed_set]
+        r.recompute()
+    sol.routes = [r for r in sol.routes if r.customers]
+
+
+# ─── Repair operators ───
+
+def greedy_insertion(sol, removed):
+    """Insert removed customers greedily (cheapest feasible position)."""
+    removed_list = list(removed)
+    rng.shuffle(removed_list)
+
+    for u in removed_list:
+        best_delta = float('inf')
+        best_ri = -1
+        best_pos = -1
+
+        for ri, r in enumerate(sol.routes):
+            for pos in range(len(r.customers) + 1):
+                feas, delta = r.can_insert(pos, u)
+                if feas and delta < best_delta:
+                    best_delta = delta
+                    best_ri = ri
+                    best_pos = pos
+
+        new_route_cost = cost_mat[0][u] + cost_mat[u][0] + Gamma
+        if best_ri >= 0 and best_delta < new_route_cost:
+            sol.routes[best_ri].insert(best_pos, u)
+        else:
+            sol.routes.append(Route([u]))
+
+    removed.clear()
+    sol.recompute_objective()
+
+
+def regret2_insertion(sol, removed):
+    """Insert removed customers by regret-2 heuristic."""
+    unassigned = set(removed)
+
+    while unassigned:
+        best_u = None
+        best_regret = -float('inf')
+        best_ri = -1
+        best_pos = -1
+        best_delta = float('inf')
+
+        for u in unassigned:
+            insertions = []
+            for ri, r in enumerate(sol.routes):
+                for pos in range(len(r.customers) + 1):
+                    feas, delta = r.can_insert(pos, u)
+                    if feas:
+                        insertions.append((delta, ri, pos))
+
+            new_route_cost = cost_mat[0][u] + cost_mat[u][0] + Gamma
+            insertions.append((new_route_cost, -1, 0))
+            insertions.sort(key=lambda x: x[0])
+
+            regret = insertions[1][0] - insertions[0][0] if len(insertions) >= 2 else float('inf')
+
+            if regret > best_regret or (abs(regret - best_regret) < 1e-9 and insertions[0][0] < best_delta):
+                best_regret = regret
+                best_u = u
+                best_ri = insertions[0][1]
+                best_pos = insertions[0][2]
+                best_delta = insertions[0][0]
+
+        if best_u is None:
+            break
+
+        if best_ri == -1:
+            sol.routes.append(Route([best_u]))
+        else:
+            sol.routes[best_ri].insert(best_pos, best_u)
+        unassigned.discard(best_u)
+
+    removed.clear()
+    sol.recompute_objective()
+
+
+def noisy_greedy_insertion(sol, removed):
+    """Greedy insertion with noise for diversification."""
+    d_max = float(np.max(cost_mat))
+    eta = 0.025
+    removed_list = list(removed)
+    rng.shuffle(removed_list)
+
+    for u in removed_list:
+        best_delta = float('inf')
+        best_ri = -1
+        best_pos = -1
+
+        for ri, r in enumerate(sol.routes):
+            for pos in range(len(r.customers) + 1):
+                feas, delta = r.can_insert(pos, u)
+                if feas:
+                    noisy_delta = delta + rng.uniform(-1, 1) * eta * d_max
+                    if noisy_delta < best_delta:
+                        best_delta = noisy_delta
+                        best_ri = ri
+                        best_pos = pos
+
+        new_route_cost = cost_mat[0][u] + cost_mat[u][0] + Gamma
+        noisy_new = new_route_cost + rng.uniform(-1, 1) * eta * d_max
+        if best_ri >= 0 and best_delta < noisy_new:
+            sol.routes[best_ri].insert(best_pos, u)
+        else:
+            sol.routes.append(Route([u]))
+
+    removed.clear()
+    sol.recompute_objective()
+
+
+# ─── Local search ───
 
 def local_search(sol):
-    """Apply first-improvement local search operators."""
+    """First-improvement local search: relocate, swap, or-opt."""
     improved = True
-    max_iters = 5  # limit to avoid spending too much time
-    iters = 0
-    while improved and iters < max_iters and time_remaining() > 1.5:
+    max_passes = 3
+    passes = 0
+    while improved and passes < max_passes and time_remaining() > 1.5:
         improved = False
-        iters += 1
+        passes += 1
 
-        # Intra-route relocate
+        # Intra-route or-opt(1): relocate within same route
         for r in sol.routes:
-            if intra_relocate(r):
+            if _intra_relocate(r):
                 improved = True
 
         # Inter-route relocate
-        for i in range(len(sol.routes)):
-            for j in range(len(sol.routes)):
-                if i == j:
+        n_routes = len(sol.routes)
+        for i in range(n_routes):
+            for j in range(n_routes):
+                if i == j or not sol.routes[i].customers:
                     continue
-                if inter_relocate(sol.routes[i], sol.routes[j]):
+                if _inter_relocate(sol.routes[i], sol.routes[j]):
                     improved = True
 
         # Inter-route swap
-        for i in range(len(sol.routes)):
-            for j in range(i + 1, len(sol.routes)):
-                if inter_swap(sol.routes[i], sol.routes[j]):
+        for i in range(n_routes):
+            for j in range(i + 1, n_routes):
+                if not sol.routes[i].customers or not sol.routes[j].customers:
+                    continue
+                if _inter_swap(sol.routes[i], sol.routes[j]):
                     improved = True
 
-        # Remove empty routes
         sol.routes = [r for r in sol.routes if r.customers]
+    sol.recompute_objective()
 
 
-def intra_relocate(route):
-    """Try moving a customer to a better position within the same route."""
+def _intra_relocate(route):
+    """Move a customer to a better position within the same route."""
     m = len(route.customers)
     if m <= 1:
         return False
-    best_improvement = 0
-    best_from, best_to = -1, -1
+    original_cost = route.cost
 
     for i in range(m):
         c = route.customers[i]
-        # Temporarily remove
-        old_customers = route.customers[:]
+        # Remove c temporarily
         route.customers.pop(i)
         route.recompute()
 
+        best_pos = -1
+        best_delta = float('inf')
         for j in range(len(route.customers) + 1):
-            delta, feas = route.check_insert(c, j)
-            if feas:
-                # Total change: new cost - original cost
-                new_cost = route.cost + delta
-                orig_cost_with_c = Route(old_customers).cost
-                improvement = orig_cost_with_c - (route.cost + delta)
-                if improvement > best_improvement + 1e-9:
-                    best_improvement = improvement
-                    best_from = i
-                    best_to = j
+            feas, delta = route.can_insert(j, c)
+            if feas and delta < best_delta:
+                best_delta = delta
+                best_pos = j
 
-        route.customers = old_customers
-        route.recompute()
+        if best_pos >= 0 and (route.cost + best_delta) < original_cost - 1e-9:
+            route.insert(best_pos, c)
+            return True
+        else:
+            # Restore
+            route.customers.insert(i, c)
+            route.recompute()
 
-    if best_from >= 0:
-        c = route.customers.pop(best_from)
-        # Adjust insertion index
-        if best_to > best_from:
-            best_to -= 1
-        route.customers.insert(best_to, c)
-        route.recompute()
-        return True
     return False
 
 
-def inter_relocate(r1, r2):
-    """Try moving a customer from r1 to r2."""
-    best_improvement = 0
-    best_ci = -1
-    best_pos = -1
-
+def _inter_relocate(r1, r2):
+    """Move a customer from r1 to r2 if it improves total cost."""
     for ci in range(len(r1.customers)):
         c = r1.customers[ci]
-        # Cost of removing from r1
-        prev1 = 0 if ci == 0 else r1.customers[ci - 1]
-        nxt1 = 0 if ci == len(r1.customers) - 1 else r1.customers[ci + 1]
-        remove_saving = C[prev1][c] + C[c][nxt1] - C[prev1][nxt1]
+        # Removal saving from r1
+        prev = 0 if ci == 0 else r1.customers[ci - 1]
+        nxt = 0 if ci == len(r1.customers) - 1 else r1.customers[ci + 1]
+        remove_saving = cost_mat[prev][c] + cost_mat[c][nxt] - cost_mat[prev][nxt]
 
         # Best insertion in r2
         for pos in range(len(r2.customers) + 1):
-            delta, feas = r2.check_insert(c, pos)
-            if feas:
-                improvement = remove_saving - delta
-                if improvement > best_improvement + 1e-9:
-                    best_improvement = improvement
-                    best_ci = ci
-                    best_pos = pos
-
-    if best_ci >= 0:
-        c = r1.remove(best_ci)
-        r2.insert(c, best_pos)
-        return True
+            feas, delta = r2.can_insert(pos, c)
+            if feas and remove_saving - delta > 1e-9:
+                r1.customers.pop(ci)
+                r1.recompute()
+                r2.insert(pos, c)
+                return True
     return False
 
 
-def inter_swap(r1, r2):
-    """Try swapping one customer between two routes."""
-    best_improvement = 0
-    best_i, best_j = -1, -1
-
+def _inter_swap(r1, r2):
+    """Swap one customer between two routes if it improves cost."""
     for i in range(len(r1.customers)):
         c1 = r1.customers[i]
         for j in range(len(r2.customers)):
             c2 = r2.customers[j]
 
-            # Check capacity
-            new_load_1 = r1.load - s[c1] + s[c2]
-            new_load_2 = r2.load - s[c2] + s[c1]
+            new_load_1 = r1.load - dem[c1] + dem[c2]
+            new_load_2 = r2.load - dem[c2] + dem[c1]
             if new_load_1 > Q or new_load_2 > Q:
                 continue
 
-            # Try the swap
+            old_cost = r1.cost + r2.cost
             r1.customers[i] = c2
             r2.customers[j] = c1
             r1.recompute()
             r2.recompute()
 
-            if r1.is_feasible() and r2.is_feasible():
-                old_cost = Route(r1.customers[:i] + [c1] + r1.customers[i+1:]).cost + \
-                           Route(r2.customers[:j] + [c2] + r2.customers[j+1:]).cost
-                new_cost = r1.cost + r2.cost
-                improvement = old_cost - new_cost
-                if improvement > best_improvement + 1e-9:
-                    best_improvement = improvement
-                    best_i, best_j = i, j
+            if r1.is_feasible() and r2.is_feasible() and r1.cost + r2.cost < old_cost - 1e-9:
+                return True
 
             # Undo
             r1.customers[i] = c1
             r2.customers[j] = c2
             r1.recompute()
             r2.recompute()
-
-    if best_i >= 0:
-        c1 = r1.customers[best_i]
-        c2 = r2.customers[best_j]
-        r1.customers[best_i] = c2
-        r2.customers[best_j] = c1
-        r1.recompute()
-        r2.recompute()
-        return True
     return False
 
 
-# ─── Van Minimization ───
+# ─── Van minimization ───
 
 def try_reduce_vans(sol):
     """Try to empty the smallest route by redistributing its customers."""
@@ -597,39 +640,41 @@ def try_reduce_vans(sol):
 
     sol.routes.sort(key=lambda r: len(r.customers))
 
-    for ri in range(len(sol.routes)):
+    for ri in range(min(3, len(sol.routes))):  # try the 3 smallest routes
         route = sol.routes[ri]
         customers_to_move = route.customers[:]
         other_routes = [r.copy() for r in sol.routes if r is not route]
 
         success = True
-        for c in sorted(customers_to_move, key=lambda c: tw_hi[c]):
+        for c in sorted(customers_to_move, key=lambda c: tw_high[c]):
             inserted = False
             best_delta, best_rj, best_pos = float('inf'), -1, -1
             for rj, r in enumerate(other_routes):
                 for pos in range(len(r.customers) + 1):
-                    delta, feas = r.check_insert(c, pos)
+                    feas, delta = r.can_insert(pos, c)
                     if feas and delta < best_delta:
-                        best_delta, best_rj, best_pos = delta, rj, pos
+                        best_delta = delta
+                        best_rj = rj
+                        best_pos = pos
                         inserted = True
             if inserted:
-                other_routes[best_rj].insert(c, best_pos)
+                other_routes[best_rj].insert(best_pos, c)
             else:
                 success = False
                 break
 
         if success:
-            # Check if objective improves
-            old_obj = sol.objective()
+            old_obj = sol.total_cost
             new_obj = sum(r.cost for r in other_routes) + Gamma * len(other_routes)
             if new_obj < old_obj - 1e-9:
                 sol.routes = other_routes
+                sol.recompute_objective()
                 return True
 
     return False
 
 
-# ─── ALNS Main Loop ───
+# ─── ALNS main loop ───
 
 def solve():
     global start_time, TIME_LIMIT
@@ -642,14 +687,14 @@ def solve():
 
     parse_input(input_file)
 
-    # Construction
-    current = construct_initial()
+    # Phase 1: Construction
+    current = construct_regret2()
     best = current.copy()
-    best_obj = best.objective()
+    best_obj = best.total_cost
 
-    # ALNS setup
-    destroy_ops = [random_removal, worst_removal, shaw_removal, tw_removal]
-    repair_ops = [greedy_insertion, regret2_insertion]
+    # ALNS operator lists
+    destroy_ops = [random_removal, worst_removal, shaw_removal, string_removal]
+    repair_ops = [greedy_insertion, regret2_insertion, noisy_greedy_insertion]
 
     n_d = len(destroy_ops)
     n_r = len(repair_ops)
@@ -660,23 +705,23 @@ def solve():
     d_uses = [0] * n_d
     r_uses = [0] * n_r
 
-    SIGMA_1 = 33  # new best
-    SIGMA_2 = 9   # improving
-    SIGMA_3 = 2   # accepted
+    SIGMA_1 = 33   # new global best
+    SIGMA_2 = 9    # improving, accepted
+    SIGMA_3 = 13   # worse, accepted
     DECAY = 0.1
     SEGMENT_SIZE = 100
 
-    # SA parameters
-    init_obj = current.objective()
-    temperature = 0.05 * max(init_obj, 1)
-    cooling = 0.9997
+    # SA parameters: calibrate initial temp so 5% worse is accepted at 50%
+    init_obj = max(current.total_cost, 1e-6)
+    temperature = -0.05 * init_obj / math.log(0.5)
+    cooling = 0.99975
 
     iteration = 0
     segment_iter = 0
 
     def select_op(weights):
         total = sum(weights)
-        r = random.random() * total
+        r = rng.random() * total
         cum = 0
         for i, w in enumerate(weights):
             cum += w
@@ -684,16 +729,18 @@ def solve():
                 return i
         return len(weights) - 1
 
-    while time_remaining() > 1.0:
+    # Phase 2: ALNS main loop
+    while time_remaining() > 1.5:
         di = select_op(d_weights)
-        ri = select_op(r_weights)
+        ri_op = select_op(r_weights)
 
         candidate = current.copy()
-        destroy_ops[di](candidate)
-        repair_ops[ri](candidate)
+        removed = set()
+        destroy_ops[di](candidate, removed)
+        repair_ops[ri_op](candidate, removed)
 
-        cand_obj = candidate.objective()
-        curr_obj = current.objective()
+        cand_obj = candidate.total_cost
+        curr_obj = current.total_cost
         delta = cand_obj - curr_obj
 
         score = 0
@@ -703,7 +750,7 @@ def solve():
             best_obj = cand_obj
         elif delta < -1e-9:
             score = SIGMA_2
-        elif delta < 1e-9 or random.random() < math.exp(-delta / max(temperature, 1e-10)):
+        elif delta < 1e-9 or rng.random() < math.exp(-delta / max(temperature, 1e-10)):
             score = SIGMA_3
         else:
             score = 0
@@ -712,63 +759,66 @@ def solve():
             current = candidate
 
         d_scores[di] += score
-        r_scores[ri] += score
+        r_scores[ri_op] += score
         d_uses[di] += 1
-        r_uses[ri] += 1
+        r_uses[ri_op] += 1
 
         # Periodic local search
         if iteration % 50 == 0 and time_remaining() > 2.0:
             local_search(current)
-            curr_obj = current.objective()
-            if curr_obj < best_obj - 1e-9:
+            if current.total_cost < best_obj - 1e-9:
                 best = current.copy()
-                best_obj = curr_obj
+                best_obj = best.total_cost
 
         # Periodic van reduction
-        if iteration % 200 == 0 and time_remaining() > 2.0:
+        if iteration % 500 == 0 and time_remaining() > 2.0:
             if try_reduce_vans(current):
-                curr_obj = current.objective()
-                if curr_obj < best_obj - 1e-9:
+                if current.total_cost < best_obj - 1e-9:
                     best = current.copy()
-                    best_obj = curr_obj
+                    best_obj = best.total_cost
 
-        # Weight update
+        # Adaptive weight update
         segment_iter += 1
         if segment_iter >= SEGMENT_SIZE:
             for i in range(n_d):
                 if d_uses[i] > 0:
                     d_weights[i] = d_weights[i] * (1 - DECAY) + DECAY * d_scores[i] / d_uses[i]
                 d_weights[i] = max(d_weights[i], 0.01)
-                d_scores[i] = 0
-                d_uses[i] = 0
+                d_scores[i] = 0; d_uses[i] = 0
             for i in range(n_r):
                 if r_uses[i] > 0:
                     r_weights[i] = r_weights[i] * (1 - DECAY) + DECAY * r_scores[i] / r_uses[i]
                 r_weights[i] = max(r_weights[i], 0.01)
-                r_scores[i] = 0
-                r_uses[i] = 0
+                r_scores[i] = 0; r_uses[i] = 0
             segment_iter = 0
+
+        # Adaptive cooling rate after warmup
+        if iteration == 200:
+            rate = 200 / max(elapsed(), 0.01)
+            est_remaining = int(rate * time_remaining())
+            if est_remaining > 0:
+                cooling = 0.01 ** (1.0 / est_remaining)
 
         temperature *= cooling
         iteration += 1
 
-    # Final local search on best
-    if time_remaining() > 0.8:
+    # Phase 3: Final polish
+    if time_remaining() > 1.0:
         current = best.copy()
         local_search(current)
-        if current.objective() < best_obj:
+        if current.total_cost < best_obj:
             best = current
+            best_obj = best.total_cost
 
-    # Final van reduction
     if time_remaining() > 0.5:
         try_reduce_vans(best)
+        best_obj = best.total_cost
 
-    # Write output
     write_output(output_file, best)
 
 
 def write_output(filepath, sol):
-    obj = sol.objective()
+    obj = sol.total_cost
     routes = sol.routes
     lines = []
     if obj == int(obj):
@@ -779,7 +829,7 @@ def write_output(filepath, sol):
     for r in routes:
         parts = [str(len(r.customers))]
         for k, c in enumerate(r.customers):
-            arr = r.arrival[k]
+            arr = r.earliest[k]
             if arr == int(arr):
                 parts.append(f"{c} {int(arr)}")
             else:
